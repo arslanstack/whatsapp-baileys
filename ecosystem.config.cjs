@@ -4,7 +4,7 @@ module.exports = {
         {
             name: 'wab',
             script: 'server.js',
-            instances: 1,              // a single WhatsApp connection — never cluster this
+            exec_mode: 'fork',         // single stateful WhatsApp socket — must be fork, not cluster
             autorestart: true,
             max_memory_restart: '300M', // hard ceiling; creds persist so restart is seamless
             env: {

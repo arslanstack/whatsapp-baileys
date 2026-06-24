@@ -124,6 +124,23 @@ export async function sendMessage(to, text) {
     return { id: sent.key.id, to: digits }
 }
 
+export async function requestPairing(number) {
+    if (state === 'open') {
+        const err = new Error('Already connected')
+        err.code = 'ALREADY_CONNECTED'
+        throw err
+    }
+    if (!sock) {
+        const err = new Error('Socket not ready yet')
+        err.code = 'NOT_READY'
+        throw err
+    }
+    const digits = String(number).replace(/\D/g, '')
+    const code = await sock.requestPairingCode(digits)
+    console.log(`🔢 Pairing code for ${digits}: ${code}`)
+    return code
+}
+
 export async function reconnect() {
     // Force-close; the close handler reconnects (it's not a loggedOut event).
     try {

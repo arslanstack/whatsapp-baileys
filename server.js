@@ -84,6 +84,22 @@ app.post('/api/send', async (req, res) => {
     }
 })
 
+app.post('/api/pair', async (req, res) => {
+    const { number } = req.body ?? {}
+    if (!number) {
+        return res.status(422).json({ success: false, message: 'Field "number" is required.' })
+    }
+    try {
+        const code = await wa.requestPairing(number)
+        res.json({ success: true, code })
+    } catch (err) {
+        if (err.code === 'ALREADY_CONNECTED') {
+            return res.status(409).json({ success: false, message: 'Already connected.' })
+        }
+        res.status(500).json({ success: false, message: err.message })
+    }
+})
+
 app.post('/api/reconnect', async (req, res) => {
     await wa.reconnect()
     res.json({ success: true })

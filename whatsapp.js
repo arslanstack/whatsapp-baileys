@@ -55,6 +55,9 @@ export async function start() {
             browser: Browsers.ubuntu('Chrome'),
             syncFullHistory: false,
             markOnlineOnConnect: false,
+            qrTimeout: 120_000,        // keep each QR/socket alive 2 min for scanning
+            connectTimeoutMs: 60_000,  // give the handshake more time on a VPS link
+            keepAliveIntervalMs: 15_000,
         })
 
         sock.ev.on('creds.update', saveCreds)

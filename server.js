@@ -14,13 +14,15 @@ if (!SECRET) {
 }
 
 const app = express()
+app.set('trust proxy', 1) // behind CloudPanel's reverse proxy (one hop)
 app.use(helmet())
 app.use(express.json())
 app.use(rateLimit({ windowMs: 60_000, max: 120 }))
 
-// ── Auth: every route except /health requires the shared secret ──
+// ── Auth: every route except /health and /link requires the shared secret ──
+// (/link does its own ?key= check since a browser can't send custom headers)
 app.use((req, res, next) => {
-    if (req.path === '/health') return next()
+    if (req.path === '/health' || req.path === '/link') return next()
     if (req.get('X-Internal-Secret') !== SECRET) {
         return res.status(401).json({ success: false, message: 'Unauthorized.' })
     }
@@ -29,6 +31,29 @@ app.use((req, res, next) => {
 
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', state: wa.getStatus().state })
+})
+
+// Self-refreshing QR page for first-time/relink scanning. Auth via ?key=.
+// Open https://wab.tarkib.co.uk/link?key=<INTERNAL_SECRET> in a browser.
+app.get('/link', (req, res) => {
+    if (req.query.key !== SECRET) {
+        return res.status(401).send('Unauthorized.')
+    }
+
+    const { qr, state } = wa.getQR()
+    let body
+    if (state === 'open') {
+        body = '<h2>✅ Connected</h2><p>This number is linked.</p>'
+    } else if (qr) {
+        body = `<img src="${qr}" alt="QR" style="width:320px;height:320px">
+                <p>WhatsApp → Linked Devices → Link a Device. Auto-refreshes every 3s.</p>`
+    } else {
+        body = '<p>Waiting for a QR code… (refreshing)</p>'
+    }
+
+    res.send(`<!doctype html><html><head><meta http-equiv="refresh" content="3">
+        <title>Link wab</title></head>
+        <body style="font-family:sans-serif;text-align:center;padding:40px">${body}</body></html>`)
 })
 
 app.get('/api/status', (req, res) => {

@@ -1,0 +1,20 @@
+{
+  "name": "wab",
+  "version": "1.0.0",
+  "description": "Thin WhatsApp (Baileys) engine for Notify",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "baileys": "^6.7.9",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "express-rate-limit": "^7.4.1",
+    "helmet": "^8.0.0",
+    "pino": "^9.5.0",
+    "qrcode": "^1.5.4"
+  }
+}

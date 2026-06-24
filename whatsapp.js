@@ -52,9 +52,9 @@ export async function start() {
             version,
             auth: authState,
             logger,
-            browser: Browsers.ubuntu('Chrome'),
+            browser: Browsers.macOS('Desktop'), // present as a normal WhatsApp Desktop client
             syncFullHistory: false,
-            markOnlineOnConnect: false,
+            markOnlineOnConnect: true,          // mark online so outgoing messages route/propagate reliably
             qrTimeout: 120_000,        // keep each QR/socket alive 2 min for scanning
             connectTimeoutMs: 60_000,  // give the handshake more time on a VPS link
             keepAliveIntervalMs: 15_000,
@@ -76,6 +76,13 @@ export async function start() {
                 phone = sock.user?.id?.split(':')[0]?.split('@')[0] ?? null
                 since = new Date().toISOString()
                 console.log(`✅ Connected as ${phone}`)
+
+                // Announce presence so WhatsApp treats this device as active.
+                try {
+                    await sock.sendPresenceUpdate('available')
+                } catch {
+                    // non-fatal
+                }
             }
 
             if (connection === 'close') {

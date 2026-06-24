@@ -52,7 +52,7 @@ export async function start() {
             version,
             auth: authState,
             logger,
-            browser: Browsers.macOS('Desktop'), // present as a normal WhatsApp Desktop client
+            browser: Browsers.windows('Chrome'), // present as WhatsApp Web on Windows/Chrome
             syncFullHistory: false,
             markOnlineOnConnect: true,          // mark online so outgoing messages route/propagate reliably
             qrTimeout: 120_000,        // keep each QR/socket alive 2 min for scanning

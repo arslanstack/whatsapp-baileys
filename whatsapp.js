@@ -8,6 +8,7 @@ import { Boom } from '@hapi/boom'
 import QRCode from 'qrcode'
 import pino from 'pino'
 import { rm } from 'node:fs/promises'
+import { SocksProxyAgent } from 'socks-proxy-agent'
 
 // ── Silence libsignal's internal console noise (prekey/session churn) ──
 // libsignal logs directly via console.log and ignores our pino logger.
@@ -48,11 +49,19 @@ export async function start() {
         // triggers immediate code-405 disconnect loops with no QR.
         const { version } = await fetchLatestBaileysVersion()
 
+        // Optional: route the WhatsApp connection through a SOCKS proxy (e.g. a
+        // Tailscale exit node on a phone) so traffic exits a residential IP.
+        const proxyUrl = process.env.WAB_PROXY
+        const agent = proxyUrl ? new SocksProxyAgent(proxyUrl) : undefined
+        if (proxyUrl) console.log(`Routing WhatsApp through proxy ${proxyUrl}`)
+
         sock = makeWASocket({
             version,
             auth: authState,
             logger,
-            browser: Browsers.windows('Chrome'), // present as WhatsApp Web on Windows/Chrome
+            agent,                              // WebSocket connection to WhatsApp
+            fetchAgent: agent,                  // media/HTTP requests
+            browser: Browsers.windows('Firefox'), // present as WhatsApp Web on Windows/Firefox
             syncFullHistory: false,
             markOnlineOnConnect: true,          // mark online so outgoing messages route/propagate reliably
             qrTimeout: 120_000,        // keep each QR/socket alive 2 min for scanning

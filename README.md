@@ -2,7 +2,79 @@
 
 A thin, single-purpose Node service that owns one WhatsApp connection (via [Baileys](https://github.com/WhiskeySockets/Baileys)) and exposes a small HTTP API. It does **no** logging, queueing, or business logic — that's [Notify](https://notify.tarkib.co.uk)'s job. wab just connects and sends.
 
-Runs on `127.0.0.1:3210` in PM2 **fork** mode, fronted by a CloudPanel reverse proxy at `https://wab.tarkib.co.uk` with SSL. Every endpoint requires the `X-Internal-Secret` header (except `/health` and `/link`).
+Runs on `127.0.0.1:3210` in PM2 **fork** mode, behind a CloudPanel reverse proxy at `https://wab.tarkib.co.uk` (SSL). Every endpoint requires the `X-Internal-Secret` header (except `/health`).
+
+> **The single most important fact:** wab routes its WhatsApp connection through a **residential IP** (a phone running Tailscale as an exit node). Without this it does not work — see [Why the residential proxy is essential](#why-the-residential-proxy-is-essential).
+
+---
+
+## Table of contents
+- [Why the residential proxy is essential](#why-the-residential-proxy-is-essential)
+- [Architecture](#architecture)
+- [Requirements](#requirements)
+- [API](#api)
+- [Deploy the service](#deploy-the-service)
+- [Set up the residential proxy (Tailscale)](#set-up-the-residential-proxy-tailscale)
+- [Link a WhatsApp number](#link-a-whatsapp-number)
+- [Changing the number](#changing-the-number)
+- [Warm-up & safe usage](#warm-up--safe-usage)
+- [Operational notes & gotchas](#operational-notes--gotchas)
+
+---
+
+## Why the residential proxy is essential
+
+WhatsApp **silently restricts Baileys companion devices that connect from datacenter / VPS IPs.** The symptom is nasty and confusing:
+
+- The socket connects fine and `/api/send` returns `success` with a real message ID…
+- …but the messages **never propagate** — not to the recipient, and **not even to the primary phone's own chat list**.
+- Meanwhile a *genuine* WhatsApp Web/Desktop device on the same account works perfectly, and manual phone messages send fine.
+
+So the **account is healthy** — WhatsApp is specifically dropping the unofficial companion's traffic because it originates from a flagged datacenter IP. No browser-identity change, presence flag, or re-link fixes this.
+
+**The fix:** make wab's WhatsApp connection exit from a **residential IP**. We do this by running [Tailscale](https://tailscale.com) on a phone (as an *exit node*) and routing **only wab's WhatsApp socket** through it via a local SOCKS proxy. WhatsApp then sees the companion on a normal residential IP, co-located with the primary phone, and everything propagates.
+
+Two hard-won rules that go with this:
+1. **Use an aged, warmed-up number** — a fresh/temp number gets burned almost immediately. (We burned one permanently during development.)
+2. **Link once, gently, and never churn it** — repeated re-link/logout cycles are what flag a number, *more* than the IP. Leave a working session alone.
+
+## Architecture
+
+```
+                       https://notify.tarkib.co.uk            https://wab.tarkib.co.uk
+                                  │                                      │
+                          ┌───────▼────────┐                    ┌────────▼─────────┐
+                          │ Notify (Laravel)│  localhost call    │ CloudPanel proxy │
+                          │ API · queue ·   │───X-Internal-Secret│   → 127.0.0.1:3210│
+                          │ logging · UI    │                    └────────┬─────────┘
+                          └─────────────────┘                             │
+                                                              ┌───────────▼────────────┐
+                                                              │ wab (Node, PM2 fork)    │
+                                                              │ Baileys socket          │
+                                                              │   └─ agent: SOCKS5 ─────┐│
+                                                              └─────────────────────────┘│
+                                                                                         │ socks5h://127.0.0.1:1055
+                                                              ┌──────────────────────────▼┐
+                                                              │ tailscaled (userspace, PM2)│
+                                                              │ SOCKS5 :1055 → exit node   │
+                                                              └──────────────┬─────────────┘
+                                                                             │ Tailscale
+                                                              ┌──────────────▼─────────────┐
+                                                              │ Phone (Tailscale exit node)│
+                                                              │ home WiFi · residential IP │
+                                                              └──────────────┬─────────────┘
+                                                                             ▼
+                                                                       WhatsApp servers
+```
+
+Only wab's WhatsApp traffic goes through the phone. Everything else on the server (Notify, system, updates) uses its normal connection — and if the phone goes offline, **only wab** is affected.
+
+## Requirements
+
+- **An aged, warmed WhatsApp number** registered on a primary phone (Baileys links as a *companion*; it does not register numbers). Not a fresh/temp number.
+- **A phone to act as the Tailscale exit node**, kept **at home on stable WiFi, plugged in** (mobile data causes connection flapping — see gotchas).
+- **VPS:** Node 20+, PM2, a CloudPanel reverse-proxy site with SSL.
+- **A Tailscale account** (free tier is enough).
 
 ## API
 
@@ -10,95 +82,123 @@ Runs on `127.0.0.1:3210` in PM2 **fork** mode, fronted by a CloudPanel reverse p
 |---|---|---|---|
 | `GET` | `/health` | — | `{ status, state }` (no auth) |
 | `GET` | `/api/status` | — | `{ state, phone, since, hasQr }` |
-| `GET` | `/api/qr` | — | `{ qr: "<data-url>" \| null, state }` |
 | `POST` | `/api/pair` | `{ number }` | `{ success, code }` — 8-char pairing code |
 | `POST` | `/api/send` | `{ to, message }` | `{ success, id, to }` |
 | `POST` | `/api/reconnect` | — | `{ success }` |
 | `POST` | `/api/logout` | — | `{ success }` |
-| `GET` | `/link?key=<secret>` | — | HTML page with a live auto-refreshing QR |
 
-`state` is one of `connecting`, `open`, `logged_out`.
+`state`: `connecting` · `open` · `logged_out`. `/api/send` errors: `409` not connected · `400` not on WhatsApp · `422` missing fields. All endpoints except `/health` require header `X-Internal-Secret`.
 
-`/api/send` errors: `409` not connected · `400` number not on WhatsApp · `422` missing fields.
+## Deploy the service
 
-## Deploy (server, one-time)
+On the VPS, as the **site user** (e.g. `tarkib-wab`) — no root needed:
 
 ```bash
-# 1. Clone (CloudPanel reverse-proxy sites don't serve files, so location is flexible)
 cd ~/htdocs && git clone <repo-url> wab.tarkib.co.uk && cd wab.tarkib.co.uk
-
-# 2. Install deps (no Chromium — Baileys is pure WebSocket)
 npm ci
 
-# 3. Configure the shared secret
 cp .env.example .env
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"   # paste into INTERNAL_SECRET
-nano .env
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"   # → INTERNAL_SECRET
+nano .env     # set INTERNAL_SECRET and WAB_PROXY=socks5h://127.0.0.1:1055
+```
 
-# 4. Install PM2 (once, as root) then launch in fork mode
-npm install -g pm2                 # as root
-pm2 start ecosystem.config.cjs     # as the site user
+PM2 (install once as root: `npm install -g pm2`):
+
+```bash
+pm2 start ecosystem.config.cjs    # runs wab in fork mode
 pm2 save
-pm2 startup                        # prints a sudo command — run it as root, then `pm2 save` again
+pm2 startup                        # run the printed sudo command as root, then `pm2 save` again
 ```
 
-Then in CloudPanel: create a **Reverse Proxy** site for `wab.tarkib.co.uk` → `http://127.0.0.1:3210`, and issue Let's Encrypt SSL.
+In CloudPanel: create a **Reverse Proxy** site for `wab.tarkib.co.uk` → `http://127.0.0.1:3210`, issue Let's Encrypt SSL.
 
-## Linking the WhatsApp number — use the PAIRING CODE
+## Set up the residential proxy (Tailscale)
 
-> ⚠️ **QR scanning does not work from a datacenter/VPS IP.** WhatsApp refuses to link a
-> device via QR from cloud IPs ("Couldn't link device. Try again later."), even though the
-> QR renders fine. **Use the pairing-code method instead** — it links over a different flow
-> that WhatsApp accepts from servers.
+This is what makes wab actually work. Two sides: the phone (exit node) and the VPS (SOCKS proxy through it).
 
-Prerequisite: the number must already be registered on WhatsApp on a **primary phone** (Baileys links as a companion device — it does not register numbers).
+### On the phone
+
+1. Install the **Tailscale** app, sign in (same account you'll use on the VPS).
+2. Enable **"Use as exit node"** (app menu / Settings → Exit Node → Run as exit node).
+3. Approve it: **https://login.tailscale.com/admin/machines** → the phone → ⋯ → **Edit route settings** → tick **Use as exit node** → Save.
+4. Harden so Android doesn't kill it:
+   - **Always-on VPN**: Android Settings → VPN → Tailscale (gear) → Always-on VPN **ON** (leave "Block connections without VPN" **OFF**).
+   - Battery: set Tailscale to **Unrestricted** + allow background + auto-launch.
+   - **Lock** Tailscale in the recent-apps list so "clear all" doesn't kill it.
+   - WiFi → **Keep WiFi on during sleep = Always**.
+   - **Keep the phone on home WiFi and plugged in.** (Mobile data / network switching causes flapping.)
+
+### On the VPS (as the site user, no root — userspace mode)
 
 ```bash
-# Request an 8-character pairing code for the number (international format, digits only)
-curl -s -X POST \
-  -H "X-Internal-Secret: <secret>" \
-  -H "Content-Type: application/json" \
-  -d '{"number":"447848103867"}' \
-  https://wab.tarkib.co.uk/api/pair
-# → {"success":true,"code":"ABCD1234"}
+cd ~
+curl -fsSL https://pkgs.tailscale.com/stable/tailscale_latest_amd64.tgz | tar xz   # use arm64 if uname -m = aarch64
+mkdir -p ~/ts-state
+
+# Run tailscaled in userspace mode with a SOCKS proxy, under PM2:
+pm2 start $HOME/tailscale_*_amd64/tailscaled --name tailscaled -- \
+  --tun=userspace-networking \
+  --socks5-server=127.0.0.1:1055 \
+  --statedir=$HOME/ts-state \
+  --socket=$HOME/ts-state/tailscaled.sock
+pm2 save
+
+# Connect, using the phone as exit node (get the phone's Tailscale IP from the admin console):
+$HOME/tailscale_*_amd64/tailscale --socket=$HOME/ts-state/tailscaled.sock up \
+  --exit-node=<PHONE_TAILSCALE_IP> --hostname=wab-vps
+# → open the printed URL, sign in with the same Tailscale account
 ```
 
-On the phone: **WhatsApp → Linked Devices → Link a Device → "Link with phone number instead"** → enter the code. WhatsApp shows a "might be a scam" warning for this flow — that's normal; proceed.
-
-Confirm:
+**Verify** the proxy exits the phone's residential IP:
 
 ```bash
-curl -s -H "X-Internal-Secret: <secret>" https://wab.tarkib.co.uk/api/status
-# → {"state":"open","phone":"447848103867",...}
+curl --socks5-hostname 127.0.0.1:1055 https://api.ipify.org   # → the phone's IP
+curl https://api.ipify.org                                    # → the VPS's IP (should differ)
 ```
 
-The session persists in `auth/`, so restarts reconnect with no re-link. `logged_out` means the phone unlinked the device — request a new pairing code to re-link.
+Then set `WAB_PROXY=socks5h://127.0.0.1:1055` in wab's `.env` and `pm2 restart wab`. wab logs `Routing WhatsApp through proxy …` on start.
 
-> Fallback if pairing code ever fails too: link from a **residential** connection (QR works there) using a local copy of this service, then `scp` the local `auth/` folder up to `~/htdocs/wab.tarkib.co.uk/auth` and `pm2 restart wab`. The IP sensitivity is only at the moment of linking — an established session runs fine from the server.
+> Note: in userspace mode, system tools like `ping` cannot reach Tailscale `100.x` addresses — only the SOCKS proxy can. That's expected and is the point (nothing system-wide is touched).
 
-## Changing the phone number (e.g. swapping the temp number for a permanent one)
+## Link a WhatsApp number
 
-1. **Register the new number on WhatsApp** on its own primary phone first (receive the SMS code, set up the account). Send a manual message or two so it's "warmed up."
-2. **Log out the current session** on the server:
-   ```bash
-   curl -s -X POST -H "X-Internal-Secret: <secret>" https://wab.tarkib.co.uk/api/logout
-   ```
-   This wipes `auth/` and resets the service to an unlinked state.
-3. **Request a pairing code for the new number** (same `/api/pair` call as above, with the new number) and enter it on the new phone.
-4. **Verify** `/api/status` shows `open` with the new number.
+**QR scanning does not work from a server** — use the **pairing code**. The number must already be registered on a primary phone.
 
-No redeploy or restart needed — linking is a runtime operation. (Notify's dashboard exposes all of this as buttons, so in practice you do it from the UI.)
-
-## Logs
+From the Notify dashboard (`/wab`): **Generate pairing code** with the number → on the phone, **WhatsApp → Linked Devices → Link a Device → "Link with phone number instead"** → enter the code. (A "might be a scam" warning is normal for this flow.) Or via API:
 
 ```bash
-pm2 logs wab
+curl -s -X POST -H "X-Internal-Secret: <secret>" -H "Content-Type: application/json" \
+  -d '{"number":"<international digits>"}' http://127.0.0.1:3210/api/pair
 ```
 
-## Operational notes / gotchas
+Confirm with `/api/status` → `"state":"open"`. The session persists in `auth/`; restarts reconnect with no re-link. **Link once and leave it alone.**
 
-- **Fork mode only.** Run under PM2 as `exec_mode: 'fork'`. Cluster mode breaks the single stateful socket (causes a code-408 `connectionLost` reconnect loop). Never set `instances` > 1.
-- **`trust proxy` is set** (`app.set('trust proxy', 1)`) because the service sits behind CloudPanel's reverse proxy — otherwise `express-rate-limit` throws on the `X-Forwarded-For` header.
-- **Stale Baileys version** causes immediate code-405 disconnect loops with no QR; the service pins the current version via `fetchLatestBaileysVersion()`.
-- **Code 515** right after first link is normal (a restart-required handshake) — it auto-reconnects to `open`.
-- **The ~14-day rule:** the primary phone must connect to WhatsApp at least every couple of weeks, or WhatsApp logs out all linked devices (including this one). Notify's weekly health check surfaces this.
+## Changing the number
+
+1. Register/age the new number on its own primary phone first.
+2. `POST /api/logout` (or dashboard **Re-link / Logout**) — wipes the session.
+3. `POST /api/pair` with the new number, enter the code on its phone.
+4. Verify `/api/status` shows `open` with the new number. No redeploy needed.
+
+## Warm-up & safe usage
+
+The number works, but stay un-flagged by behaving like a human:
+
+- **Only message people who expect it.** Recipients blocking/reporting you is the #1 ban trigger — far more than volume.
+- **Ramp gradually:** ~10–20 msgs/day week 1, ~30–50/day week 2, increase slowly after. Never sudden spikes.
+- **Two-way conversations** (replies) look natural; pure one-way blasting is a flag.
+- **Vary content** — identical bulk text looks like spam. Personalize.
+- **Don't re-link** a working session; churn is what burns numbers.
+- Internal/transactional notifications to known contacts (staff, opted-in customers) is the safest, lowest-risk use case.
+
+If the session starts logging out repeatedly or messages stop propagating, WhatsApp is pushing back — **back off the volume and let it rest.**
+
+## Operational notes & gotchas
+
+- **Fork mode only.** PM2 `exec_mode: 'fork'`. Cluster mode breaks the single stateful socket (code-408 reconnect loop). Never `instances > 1`.
+- **`trust proxy` is set** (`app.set('trust proxy', 1)`) because it's behind a reverse proxy — otherwise `express-rate-limit` throws on `X-Forwarded-For`.
+- **Phone must be on stable WiFi.** Mobile data / network-switching causes constant code-408 `connectionLost` flapping (keepalives time out over the jittery path). WiFi + plugged in is stable.
+- **Both `wab` and `tailscaled` run under PM2** as the site user; `pm2 save` + `pm2 startup` make them survive reboots.
+- **The 14-day rule:** the primary phone must connect to WhatsApp at least every couple of weeks or all linked devices get logged out.
+- **Brief drops are absorbed:** real traffic goes through Notify's queue (`SendWabJob`, 3 retries + backoff), so momentary reconnects don't lose messages. Direct `curl` to wab has no retry and will show `409` during a blip.
+- **Code 515** right after first link is normal (restart-required handshake) → auto-reconnects to `open`.
